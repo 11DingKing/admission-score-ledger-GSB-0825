@@ -1,0 +1,554 @@
+openapi: 3.1.0
+info:
+  title: Admission Score Ledger API
+  version: 1.0.0
+  summary: 投档分数账本
+  description: >-
+    接收省招办投档快照、输出最高分榜单、查询院校专业组完整变化过程的投档分数账本。
+
+
+    分数口径：score_value 一律以 0.1 分为最小单位用整数保存，禁止使用浮点数；
+    INTEGER 口径 610 分保存为 6100，DECIMAL_1 口径 604.4 分保存为 6044，
+    展示时由 API 格式化为 "610" 或 "604.4"。
+
+
+    幂等与仲裁：同一 submission_id 原样重试返回第一次的结果；载荷不同返回 409。
+    同一自然键（province_code + admission_year + batch_code + school_code +
+    major_group_code）只有更大的 source_revision 能成为当前值，迟到旧版本返回
+    202 并记作 STALE_IGNORED，但仍保留在历史中。
+
+
+    所有错误响应均为 application/problem+json（RFC 9457 扩展），必含
+    type、title、status、code、trace_id 字段。
+  contact:
+    name: Admission Score Ledger
+servers:
+  - url: http://localhost:8080
+    description: 本地开发服务器
+
+tags:
+  - name: submissions
+    description: 投档快照提交
+  - name: rankings
+    description: 最高分榜单
+  - name: history
+    description: 院校专业组变化历史
+
+paths:
+  /v1/submissions:
+    post:
+      tags: [submissions]
+      summary: 提交一次投档分数快照
+      description: >-
+        接收一个院校专业组在某省、某年、某批次的投档分数快照。处理在单个数据库
+        事务内完成：写当前快照（仅当 source_revision 更新）、追加不可变历史记录、
+        写只追加审计日志，并通过 transactional outbox 产生 ranking.changed 事件；
+        事务提交前不调用任何外部系统。
+
+
+        同一 submission_id 以完全相同载荷重试时返回第一次的结果（replayed=true）；
+        同一 submission_id 载荷变化时返回 409 SUBMISSION_CONFLICT。
+      operationId: createSubmission
+      parameters:
+        - $ref: '#/components/parameters/TraceId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Submission'
+            examples:
+              szpuInteger:
+                summary: 深圳职业技术大学 610 分（INTEGER 口径保存为 6100）
+                value:
+                  submission_id: szpu-sub-1
+                  province_code: "44"
+                  admission_year: 2025
+                  batch_code: B1
+                  school_code: szpu
+                  major_group_code: digital-media
+                  score_scale: DECIMAL_1
+                  score_value: 6100
+                  submitted_at: "2025-08-25T09:00:00Z"
+                  rule_version: rv-2025
+                  source_revision: 1
+              whpuDecimal:
+                summary: 武汉职业技术大学数字媒体艺术 604.4 分（保存为 6044）
+                value:
+                  submission_id: whpu-sub-1
+                  province_code: "44"
+                  admission_year: 2025
+                  batch_code: B1
+                  school_code: whpu
+                  major_group_code: digital-media
+                  score_scale: DECIMAL_1
+                  score_value: 6044
+                  submitted_at: "2025-08-25T09:05:00Z"
+                  rule_version: rv-2025
+                  source_revision: 1
+      responses:
+        '201':
+          description: 快照已接受并成为当前值（ACCEPTED）
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SubmissionResult'
+        '202':
+          description: 快照已记录但因 source_revision 不更新而被忽略（STALE_IGNORED），仍进入历史
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SubmissionResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          description: submission_id 已被不同载荷使用（SUBMISSION_CONFLICT）
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    get:
+      tags: [submissions]
+      summary: 不支持的方法
+      operationId: listSubmissionsNotAllowed
+      responses:
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+
+  /v1/rankings:
+    get:
+      tags: [rankings]
+      summary: 查询最高分榜单
+      description: >-
+        返回某省某年（可限定批次）所有院校专业组的当前分数榜单。排序规则：
+        分数降序；展示分数相同时依次按 submitted_at、school_code、
+        major_group_code 升序，保证每次查询顺序一致。
+      operationId: listRankings
+      parameters:
+        - $ref: '#/components/parameters/TraceId'
+        - name: province_code
+          in: query
+          required: true
+          description: 省级行政区代码
+          schema:
+            type: string
+            example: "44"
+        - name: admission_year
+          in: query
+          required: true
+          description: 录取年份
+          schema:
+            type: integer
+            minimum: 2000
+            maximum: 2100
+            example: 2025
+        - name: batch_code
+          in: query
+          required: false
+          description: 批次代码；不传则返回该省该年所有批次
+          schema:
+            type: string
+            example: B1
+      responses:
+        '200':
+          description: 榜单
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RankingsResponse'
+              examples:
+                twoSchools:
+                  summary: 610.2 排在 604.4 之前
+                  value:
+                    province_code: "44"
+                    admission_year: 2025
+                    batch_code: B1
+                    rankings:
+                      - rank: 1
+                        school_code: szpu
+                        major_group_code: digital-media
+                        score_scale: DECIMAL_1
+                        score_value: 6102
+                        score_display: "610.2"
+                        source_revision: 3
+                        rule_version: rv-2025
+                        submitted_at: "2025-08-25T09:02:00Z"
+                      - rank: 2
+                        school_code: whpu
+                        major_group_code: digital-media
+                        score_scale: DECIMAL_1
+                        score_value: 6044
+                        score_display: "604.4"
+                        source_revision: 1
+                        rule_version: rv-2025
+                        submitted_at: "2025-08-25T09:05:00Z"
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/history/{school_code}/{major_group_code}:
+    get:
+      tags: [history]
+      summary: 查询院校专业组的完整变化过程
+      description: >-
+        返回一个自然键下全部提交记录（含 STALE_IGNORED），按 source_revision
+        升序。历史记录只追加、不可修改或删除。
+      operationId: getHistory
+      parameters:
+        - $ref: '#/components/parameters/TraceId'
+        - name: school_code
+          in: path
+          required: true
+          description: 院校代码
+          schema:
+            type: string
+            example: szpu
+        - name: major_group_code
+          in: path
+          required: true
+          description: 专业组代码
+          schema:
+            type: string
+            example: digital-media
+        - name: province_code
+          in: query
+          required: true
+          schema:
+            type: string
+            example: "44"
+        - name: admission_year
+          in: query
+          required: true
+          schema:
+            type: integer
+            minimum: 2000
+            maximum: 2100
+            example: 2025
+        - name: batch_code
+          in: query
+          required: true
+          schema:
+            type: string
+            example: B1
+      responses:
+        '200':
+          description: 变化历史
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HistoryResponse'
+              examples:
+                szpuThreeChanges:
+                  summary: 三次变化都可解释：rev1 接受、rev3 接受、rev2 迟到被忽略
+                  value:
+                    natural_key:
+                      province_code: "44"
+                      admission_year: 2025
+                      batch_code: B1
+                      school_code: szpu
+                      major_group_code: digital-media
+                    records:
+                      - submission_id: szpu-sub-1
+                        source_revision: 1
+                        score_scale: DECIMAL_1
+                        score_value: 6100
+                        score_display: "610.0"
+                        status: ACCEPTED
+                        rule_version: rv-2025
+                        submitted_at: "2025-08-25T09:00:00Z"
+                        recorded_at: "2025-08-25T09:00:00Z"
+                      - submission_id: szpu-sub-2
+                        source_revision: 2
+                        score_scale: DECIMAL_1
+                        score_value: 6098
+                        score_display: "609.8"
+                        status: STALE_IGNORED
+                        rule_version: rv-2025
+                        submitted_at: "2025-08-25T09:01:00Z"
+                        recorded_at: "2025-08-25T09:02:00Z"
+                      - submission_id: szpu-sub-3
+                        source_revision: 3
+                        score_scale: DECIMAL_1
+                        score_value: 6102
+                        score_display: "610.2"
+                        status: ACCEPTED
+                        rule_version: rv-2025
+                        submitted_at: "2025-08-25T09:02:00Z"
+                        recorded_at: "2025-08-25T09:02:00Z"
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          description: 该自然键没有任何提交记录（HISTORY_NOT_FOUND）
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+components:
+  parameters:
+    TraceId:
+      name: X-Trace-Id
+      in: header
+      required: false
+      description: 调用方追踪 ID；不传时服务端生成并通过响应头返回
+      schema:
+        type: string
+  headers:
+    TraceId:
+      description: 本次请求的追踪 ID，与 problem+json 体中 trace_id 一致
+      schema:
+        type: string
+
+  responses:
+    BadRequest:
+      description: 请求体不是合法 JSON 或字段校验失败
+      headers:
+        X-Trace-Id:
+          $ref: '#/components/headers/TraceId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://admission-score-ledger.local/problems/VALIDATION_ERROR
+            title: One or more fields are invalid
+            status: 400
+            code: VALIDATION_ERROR
+            trace_id: 9f1c2e7a4b6d4f80a3e5c7d9b0f1a2c3
+            instance: /v1/submissions
+            errors:
+              - field: score_value
+                reason: must be >= 0 and stored as tenths of a point
+    MethodNotAllowed:
+      description: HTTP 方法不允许
+      headers:
+        X-Trace-Id:
+          $ref: '#/components/headers/TraceId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    InternalError:
+      description: 服务器内部错误
+      headers:
+        X-Trace-Id:
+          $ref: '#/components/headers/TraceId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+  schemas:
+    Submission:
+      type: object
+      additionalProperties: false
+      required:
+        - submission_id
+        - province_code
+        - admission_year
+        - batch_code
+        - school_code
+        - major_group_code
+        - score_scale
+        - score_value
+        - submitted_at
+        - rule_version
+        - source_revision
+      properties:
+        submission_id:
+          type: string
+          maxLength: 64
+          description: 幂等键；同一 ID 原样重试返回第一次结果，换载荷返回 409
+        province_code:
+          type: string
+          maxLength: 32
+          description: 省级行政区代码
+        admission_year:
+          type: integer
+          minimum: 2000
+          maximum: 2100
+        batch_code:
+          type: string
+          maxLength: 32
+        school_code:
+          type: string
+          maxLength: 32
+        major_group_code:
+          type: string
+          maxLength: 64
+        score_scale:
+          type: string
+          enum: [INTEGER, DECIMAL_1]
+          description: INTEGER 渲染为整数分（6100 -> "610"），DECIMAL_1 渲染一位小数（6044 -> "604.4"）
+        score_value:
+          type: integer
+          format: int64
+          minimum: 0
+          description: 以 0.1 分为单位的整数分数，禁止使用浮点数；610 分写 6100，604.4 分写 6044
+        submitted_at:
+          type: string
+          format: date-time
+          description: RFC 3339 时间戳；榜单同分 tie-break 的第一排序键
+        rule_version:
+          type: string
+          maxLength: 32
+        source_revision:
+          type: integer
+          format: int64
+          minimum: 1
+          description: 来源修订号；同一自然键仅更大值可成为当前值
+
+    Snapshot:
+      type: object
+      properties:
+        province_code: { type: string }
+        admission_year: { type: integer }
+        batch_code: { type: string }
+        school_code: { type: string }
+        major_group_code: { type: string }
+        score_scale: { $ref: '#/components/schemas/Submission/properties/score_scale' }
+        score_value: { $ref: '#/components/schemas/Submission/properties/score_value' }
+        score_display:
+          type: string
+          description: API 格式化后的展示分数，如 "610" 或 "604.4"
+        source_revision: { type: integer, format: int64 }
+        rule_version: { type: string }
+        submitted_at: { type: string, format: date-time }
+        submission_id: { type: string }
+        updated_at: { type: string, format: date-time }
+
+    HistoryRecord:
+      type: object
+      properties:
+        submission_id: { type: string }
+        source_revision: { type: integer, format: int64 }
+        score_scale: { $ref: '#/components/schemas/Submission/properties/score_scale' }
+        score_value: { $ref: '#/components/schemas/Submission/properties/score_value' }
+        score_display: { type: string }
+        status:
+          type: string
+          enum: [ACCEPTED, STALE_IGNORED]
+        rule_version: { type: string }
+        submitted_at: { type: string, format: date-time }
+        recorded_at: { type: string, format: date-time }
+
+    SubmissionResult:
+      type: object
+      properties:
+        decision:
+          type: string
+          enum: [ACCEPTED, STALE_IGNORED]
+        replayed:
+          type: boolean
+          description: true 表示这是同一 submission_id + 相同载荷的幂等重试
+        submission_id: { type: string }
+        current:
+          $ref: '#/components/schemas/Snapshot'
+        received:
+          $ref: '#/components/schemas/HistoryRecord'
+
+    RankingRow:
+      type: object
+      properties:
+        rank: { type: integer, minimum: 1 }
+        school_code: { type: string }
+        major_group_code: { type: string }
+        score_scale: { $ref: '#/components/schemas/Submission/properties/score_scale' }
+        score_value: { $ref: '#/components/schemas/Submission/properties/score_value' }
+        score_display: { type: string }
+        source_revision: { type: integer, format: int64 }
+        rule_version: { type: string }
+        submitted_at: { type: string, format: date-time }
+
+    RankingsResponse:
+      type: object
+      properties:
+        province_code: { type: string }
+        admission_year: { type: integer }
+        batch_code: { type: string }
+        rankings:
+          type: array
+          items:
+            $ref: '#/components/schemas/RankingRow'
+
+    HistoryResponse:
+      type: object
+      properties:
+        natural_key:
+          type: object
+          properties:
+            province_code: { type: string }
+            admission_year: { type: integer }
+            batch_code: { type: string }
+            school_code: { type: string }
+            major_group_code: { type: string }
+        records:
+          type: array
+          items:
+            $ref: '#/components/schemas/HistoryRecord'
+
+    Problem:
+      type: object
+      description: RFC 9457 problem details 扩展，所有错误响应的统一形态
+      required: [type, title, status, code, trace_id]
+      properties:
+        type:
+          type: string
+          format: uri
+          description: 问题种类 URI
+        title:
+          type: string
+          description: 简短可读摘要
+        status:
+          type: integer
+          description: HTTP 状态码
+        code:
+          type: string
+          description: 稳定的机器可读错误码
+          enum:
+            - MALFORMED_JSON
+            - VALIDATION_ERROR
+            - SUBMISSION_CONFLICT
+            - HISTORY_NOT_FOUND
+            - ROUTE_NOT_FOUND
+            - METHOD_NOT_ALLOWED
+            - INTERNAL_ERROR
+        trace_id:
+          type: string
+          description: 请求追踪 ID，与响应头 X-Trace-Id 一致
+        detail:
+          type: string
+        instance:
+          type: string
+          format: uri-reference
+        errors:
+          type: array
+          description: 字段级校验错误（仅 VALIDATION_ERROR）
+          items:
+            type: object
+            properties:
+              field: { type: string }
+              reason: { type: string }
