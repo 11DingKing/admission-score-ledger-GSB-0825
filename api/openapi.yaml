@@ -1,0 +1,302 @@
+openapi: 3.1.0
+info:
+  title: Admission Score Ledger API
+  version: 1.0.0
+  description: >
+    Receives投档快照 (admission score snapshots), produces highest-score rankings,
+    and exposes per-school-major-group change history. Scores are stored as integers
+    in tenths of a point; API responses format them for display.
+servers:
+  - url: /
+paths:
+  /v1/submissions:
+    post:
+      summary: Submit a score snapshot
+      description: >
+        Receives a score snapshot. Idempotent on submission_id: a repeated request
+        with the same payload returns the original result; a different payload with
+        the same submission_id returns 409. Only a higher source_revision becomes
+        the current value; older revisions are recorded as STALE_IGNORED with 202.
+      operationId: createSubmission
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SubmissionRequest'
+      responses:
+        '201':
+          description: Submission accepted and became the current snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SubmissionResponse'
+        '200':
+          description: Duplicate submission_id with identical payload.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SubmissionResponse'
+        '202':
+          description: Submission was stale (lower source_revision) and ignored.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SubmissionResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /v1/rankings:
+    get:
+      summary: List current highest-score rankings
+      description: >
+        Returns current snapshots ordered by score_value DESC, submitted_at ASC,
+        school_code ASC, major_group_code ASC.
+      operationId: listRankings
+      parameters:
+        - name: province_code
+          in: query
+          schema:
+            type: string
+        - name: admission_year
+          in: query
+          schema:
+            type: integer
+        - name: batch_code
+          in: query
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+      responses:
+        '200':
+          description: Rankings list.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/RankingEntry'
+                  count:
+                    type: integer
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /v1/history/{school_code}/{major_group_code}:
+    get:
+      summary: Get change history for a school major group
+      description: >
+        Returns every submission (accepted and stale-ignored) for the given
+        school_code and major_group_code, ordered by source_revision ascending.
+      operationId: getHistory
+      parameters:
+        - name: school_code
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: major_group_code
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: province_code
+          in: query
+          schema:
+            type: string
+        - name: admission_year
+          in: query
+          schema:
+            type: integer
+        - name: batch_code
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: History entries.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  school_code:
+                    type: string
+                  major_group_code:
+                    type: string
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/HistoryEntry'
+                  count:
+                    type: integer
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+components:
+  responses:
+    BadRequest:
+      description: Validation or bad request error.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Conflict:
+      description: Idempotency conflict.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    NotFound:
+      description: Resource not found.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    InternalError:
+      description: Internal server error.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+  schemas:
+    SubmissionRequest:
+      type: object
+      required:
+        - submission_id
+        - province_code
+        - admission_year
+        - batch_code
+        - school_code
+        - major_group_code
+        - score_scale
+        - score_value
+        - submitted_at
+        - rule_version
+        - source_revision
+      properties:
+        submission_id:
+          type: string
+          format: uuid
+        province_code:
+          type: string
+        admission_year:
+          type: integer
+        batch_code:
+          type: string
+        school_code:
+          type: string
+        major_group_code:
+          type: string
+        score_scale:
+          type: string
+          enum: [INTEGER, DECIMAL_1]
+        score_value:
+          type: integer
+          description: Score in tenths of a point (e.g. 6100 = 610.0, 6044 = 604.4).
+        submitted_at:
+          type: string
+          format: date-time
+        rule_version:
+          type: string
+        source_revision:
+          type: integer
+          minimum: 1
+    SubmissionResponse:
+      type: object
+      properties:
+        submission_id:
+          type: string
+        status:
+          type: string
+          enum: [ACCEPTED, STALE_IGNORED]
+        current_score:
+          type: integer
+          nullable: true
+        current_score_display:
+          type: string
+        source_revision:
+          type: integer
+        accepted_at:
+          type: string
+          format: date-time
+          nullable: true
+        duplicate:
+          type: boolean
+    RankingEntry:
+      type: object
+      properties:
+        province_code:
+          type: string
+        admission_year:
+          type: integer
+        batch_code:
+          type: string
+        school_code:
+          type: string
+        major_group_code:
+          type: string
+        score_scale:
+          type: string
+          enum: [INTEGER, DECIMAL_1]
+        score_value:
+          type: integer
+        score_display:
+          type: string
+        submitted_at:
+          type: string
+          format: date-time
+        source_revision:
+          type: integer
+    HistoryEntry:
+      type: object
+      properties:
+        submission_id:
+          type: string
+        score_scale:
+          type: string
+          enum: [INTEGER, DECIMAL_1]
+        score_value:
+          type: integer
+        score_display:
+          type: string
+        submitted_at:
+          type: string
+          format: date-time
+        rule_version:
+          type: string
+        source_revision:
+          type: integer
+        status:
+          type: string
+          enum: [ACCEPTED, STALE_IGNORED]
+        created_at:
+          type: string
+          format: date-time
+    Problem:
+      type: object
+      required: [type, title, status, code, trace_id]
+      properties:
+        type:
+          type: string
+        title:
+          type: string
+        status:
+          type: integer
+        code:
+          type: string
+        trace_id:
+          type: string
+        detail:
+          type: string
